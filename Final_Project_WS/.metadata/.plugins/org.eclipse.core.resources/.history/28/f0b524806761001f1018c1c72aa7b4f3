@@ -1,0 +1,788 @@
+/* Kernel includes. */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "event_groups.h"
+#include "semphr.h"
+/* MCAL includes. */
+#include "gpio.h"
+#include "ADC.h"
+#include "uart0.h"
+#include "GPTM.h"
+#include "tm4c123gh6pm_registers.h"
+/* HAL Includes*/
+#include "RGB_LED.h"
+#include "temp_sensor.h"
+/* helper libraries*/
+#include "string.h"
+/***********************************************************************
+ *                        DEFINITIONS                                  *
+ ***********************************************************************/
+#define NUMBER_OF_ITERATIONS_PER_ONE_MILI_SECOND 369
+#define DRIVER_ID                                   0
+#define PASSENGER_ID                                1
+#define QUEUE_SIZE                                  3
+/************************Event Flags Masks*****************************/
+#define mainSW2_INTERRUPT_BIT                    (1<<0U) /*SW2 Event mask*/
+#define mainSW1_INTERRUPT_BIT                    (1<<1U) /*SW1 Event mask*/
+#define mainDRIVER_SEAT_ERROR_RAISE_MASK         (1<<2U) /*Error raise mask for driver seat*/
+#define mainPASSENGER_SEAT_ERROR_RAISE_MASK      (1<<3U) /*Error raise mask for passenger seat*/
+#define mainDRIVER_SEAT_ERROR_HANDLE_MASK        (1<<4U) /*Error handled mask for driver seat*/
+#define mainPASSENGER_SEAT_ERROR_HANDLE_MASK     (1<<5U) /*Error handled mask for passenger seat*/
+
+/**************************ERROR CODES********************************/
+/*Error codes sent by the control task
+ * DEC:Driver Error Code
+ * PEC:Passenger Error Code*/
+#define DEC_Temp_BELOW_5                             0xAA
+#define DEC_Temp_ABOVE_40                            0xBB
+#define PEC_Temp_BELOW_5                             0xCC
+#define PEC_Temp_ABOVE_40                            0xDD
+
+/***********************************************************************
+ *                       TYPE DEFINITIONS                              *
+ ***********************************************************************/
+/*enum for Heater Levels*/
+typedef enum{
+    OFF,LOW,MEDIUM,HIGH
+}heatLevel_t;
+/*struct to save the state of the system*/
+typedef struct{
+    TickType_t timestamp;
+    heatLevel_t heatLevel;
+    uint8 currentTemp;
+}StateLog_t;
+
+
+/* Struct representing each seat with its specific heater and temperature sensor , the required queues for each task and
+ * event masks for each seat and the state log for each seat .
+ */
+typedef struct {
+    uint8 id;
+    rgb_ledType* led;
+    tempSensor_sensortype* tempSensor;
+    uint16 setting_task_mask;
+    uint16 error_reporting_mask;
+    uint16 error_handling_mask;
+    QueueHandle_t* read_to_ctrl_queue;
+    QueueHandle_t* set_to_ctrl_queue;
+    QueueHandle_t* ctrl_to_heat_queue;
+    QueueHandle_t* set_to_state_queue;
+    QueueSetHandle_t* set_read_to_ctrl_queue_set;
+    StateLog_t* state;
+}seat_t;
+
+/* The struct for holding the error logs*/
+typedef struct {
+    TickType_t xErrorTimeStamp;
+    uint8 ucErrorDetails[55];
+}ErrorLog_t;
+
+/*struct to hold the data required by the display task to be displayed*/
+typedef struct{
+    uint8 desiredTemp;
+    heatLevel_t workingState;
+    uint8       currentTemp;
+    boolean     errorFlag;
+}DisplayData_t;
+/***********************************************************************
+ *                       GLOBAL VARIABLES                              *
+ ***********************************************************************/
+
+/***********************  RGB LEDs  **************************************/
+rgb_ledType led = {GPIO_PORTD,{PIN0_ID,PIN1_ID,PIN2_ID}};
+rgb_ledType led2 ={GPIO_PORTF , {PIN1_ID,PIN3_ID,PIN2_ID}};
+/******************** Temperature Sensors *************************/
+tempSensor_sensortype driverSeatSensor = {(ADC_ChannelType*)&ADC_channels[0]};
+tempSensor_sensortype passengerSeatSensor = {(ADC_ChannelType*)&ADC_channels[1]};
+/********************* Event Groups********************************/
+EventGroupHandle_t xEventGroup; /*Used by all tasks*/
+/**************************Queues********************************/
+QueueHandle_t xReadToCtrlSeat1;
+QueueHandle_t xReadToCtrlSeat2;
+QueueHandle_t xSetToCtrlSeat1;
+QueueHandle_t xSetToCtrlSeat2;
+QueueHandle_t xCtrlToHeatSeat1;
+QueueHandle_t xCtrlToHeatSeat2;
+QueueHandle_t xCtrlToError;
+QueueHandle_t xSetToStateSeat1;
+QueueHandle_t xSetToStateSeat2;
+QueueSetHandle_t set_read_to_ctrl_seat_1;
+QueueSetHandle_t set_read_to_ctrl_seat_2;
+/*************************Error log array*************************/
+ErrorLog_t xErrorLogArray[10];
+/*************************State Log*******************************/
+StateLog_t xDriverStateLog;
+StateLog_t xPassengerStateLog;
+/************************Display Data****************************/
+DisplayData_t xDriverDisplayData;
+DisplayData_t xPassengerDisplayData;
+
+/***************************Seats********************************/
+seat_t driverSeat = {DRIVER_ID,
+                     &led,
+                     &driverSeatSensor,
+                     mainSW1_INTERRUPT_BIT,
+                     mainDRIVER_SEAT_ERROR_RAISE_MASK,
+                     mainDRIVER_SEAT_ERROR_HANDLE_MASK,
+                     &xReadToCtrlSeat1,
+                     &xSetToCtrlSeat1,
+                     &xCtrlToHeatSeat1,
+                     &xSetToStateSeat1,
+                     &set_read_to_ctrl_seat_1,
+                     &xDriverStateLog
+};
+
+seat_t passengerSeat = {PASSENGER_ID,
+                        &led2,
+                        &passengerSeatSensor,
+                        mainSW2_INTERRUPT_BIT,
+                        mainPASSENGER_SEAT_ERROR_RAISE_MASK,
+                        mainPASSENGER_SEAT_ERROR_HANDLE_MASK,
+                        &xReadToCtrlSeat2,
+                        &xSetToCtrlSeat2,
+                        &xCtrlToHeatSeat2,
+                        &xSetToStateSeat2,
+                        &set_read_to_ctrl_seat_2,
+                        &xPassengerStateLog
+};
+/************************RUNTIME MEASUREMENTS***************************/
+TaskHandle_t xTaskHandle1;
+TaskHandle_t xTaskHandle2;
+TaskHandle_t xTaskHandle3;
+TaskHandle_t xTaskHandle4;
+TaskHandle_t xTaskHandle5;
+TaskHandle_t xTaskHandle6;
+TaskHandle_t xTaskHandle7;
+TaskHandle_t xTaskHandle8;
+TaskHandle_t xTaskHandle9;
+TaskHandle_t xTaskHandle10;
+TaskHandle_t xTaskHandle11;
+TaskHandle_t xTaskHandle12;
+TaskHandle_t xTaskHandle13;
+TaskHandle_t xTaskHandle14;
+TaskHandle_t xTaskHandle15;
+#if(RTM_MEASUREMENTS == 1)
+uint32 ullTasksOutTime[16];
+uint32 ullTasksInTime[16];
+uint32 ullTasksTotalTime[16];
+uint32 ullTaskBlockTime[8];
+uint32 ullTaskUnBlockTime[8];
+uint32 ullTotalTaskBlockTime[8];
+#endif
+/*******************************************************************
+ *                   FUNCTION DECLARATION
+ *******************************************************************/
+/* The HW setup function */
+static void prvSetupHardware( void );
+
+/*Helper Functions*/
+heatLevel_t getDesiredHeatLevel(uint8 currentTemp,uint8 desiredTemp);
+void Heater_setTemp(rgb_ledType* led , heatLevel_t level);
+void Mcu_Init(void);
+void Delay_MS(unsigned long long n);
+
+/* FreeRTOS tasks */
+void vControlTask(void *pvParameters);
+void vHeatingTask(void *pvParameters);
+void vTemperatureReadingTask(void *pvParameters);
+void vTemperatureSettingTask(void* pvParameters);
+void vTempErrorWarningTask(void* pvParameters);
+void vTempErrorReportingTask(void* pvParameters);
+void vStateUpdateTask(void* pvParameters);
+void vStateDisplayTask(void* pvParameters);
+void vRunTimeMeasurementsTask(void *pvParameters);
+
+
+/*******************************************************************
+ *                       MAIN FUNCTION
+ *******************************************************************/
+
+
+int main(void)
+{
+    /* Setup the hardware for use with the Tiva C board. */
+    prvSetupHardware();
+
+
+    /********************************************** TASK CREATION *************************************************************/
+    xTaskCreate(vControlTask, "Control Task For driver seat", 64, (void*)&driverSeat, 2, &xTaskHandle1);
+    xTaskCreate(vHeatingTask, "Heater Task For Driver Seat", 64, (void*)&driverSeat, 2, &xTaskHandle2);
+    xTaskCreate(vTemperatureReadingTask, "Temperature Reading Task for Driver Seat", 64, (void*)&driverSeat, 3, &xTaskHandle3);
+    xTaskCreate(vTemperatureSettingTask, "Temperature setting task for Driver Seat", 64, (void*)&driverSeat, 4, &xTaskHandle4);
+    xTaskCreate(vTempErrorWarningTask, "Temperature Error Warning Task for Driver Seat", 64, (void*)&driverSeat, 2, &xTaskHandle5);
+    xTaskCreate(vTempErrorReportingTask, "Error Logging Task", 64, NULL, 3, &xTaskHandle6);
+    xTaskCreate(vStateUpdateTask, "State update task for Driver Seat", 64, (void*)&driverSeat, 2, &xTaskHandle7);
+    xTaskCreate(vStateUpdateTask, "State update task for Passenger Seat", 64, (void*)&passengerSeat, 2, &xTaskHandle8);
+    xTaskCreate(vControlTask, "Control Task For Passenger seat", 64, (void*)&passengerSeat, 2, &xTaskHandle9);
+    xTaskCreate(vHeatingTask, "Heater Task For Passenger Seat", 64, (void*)&passengerSeat, 2, &xTaskHandle10);
+    xTaskCreate(vTempErrorWarningTask, "Temperature Error Warning Task for Passenger Seat", 64, (void*)&passengerSeat, 2, &xTaskHandle11);
+    xTaskCreate(vTemperatureSettingTask, "Temperature setting task for Passenger Seat", 64, (void*)&passengerSeat, 4, &xTaskHandle12);
+    xTaskCreate(vTemperatureReadingTask, "Temperature Reading Task for Passenger Seat", 64, (void*)&passengerSeat, 3, &xTaskHandle13);
+    xTaskCreate(vStateDisplayTask, "Display Task", 64, NULL, 3, &xTaskHandle14);
+    /******************************* Setting Task Tag for RTM *********************************************************/
+#if(RTM_MEASUREMENTS == 1)
+
+    xTaskCreate(vRunTimeMeasurementsTask, "RTM Task", 200, NULL, 5, &xTaskHandle15);
+    vTaskSetApplicationTaskTag( xTaskHandle1, ( TaskHookFunction_t ) 1 );
+    vTaskSetApplicationTaskTag( xTaskHandle2, ( TaskHookFunction_t ) 2 );
+    vTaskSetApplicationTaskTag( xTaskHandle3, ( TaskHookFunction_t ) 3 );
+    vTaskSetApplicationTaskTag( xTaskHandle4, ( TaskHookFunction_t ) 4 );
+    vTaskSetApplicationTaskTag( xTaskHandle5, ( TaskHookFunction_t ) 5 );
+    vTaskSetApplicationTaskTag( xTaskHandle6, ( TaskHookFunction_t ) 6 );
+    vTaskSetApplicationTaskTag( xTaskHandle7, ( TaskHookFunction_t ) 7 );
+    vTaskSetApplicationTaskTag( xTaskHandle8, ( TaskHookFunction_t ) 8 );
+    vTaskSetApplicationTaskTag( xTaskHandle9, ( TaskHookFunction_t ) 9 );
+    vTaskSetApplicationTaskTag( xTaskHandle10, ( TaskHookFunction_t ) 10 );
+    vTaskSetApplicationTaskTag( xTaskHandle11, ( TaskHookFunction_t ) 11 );
+    vTaskSetApplicationTaskTag( xTaskHandle12, ( TaskHookFunction_t ) 12 );
+    vTaskSetApplicationTaskTag( xTaskHandle13, ( TaskHookFunction_t ) 13 );
+    vTaskSetApplicationTaskTag( xTaskHandle14, ( TaskHookFunction_t ) 14 );
+    vTaskSetApplicationTaskTag( xTaskHandle15, ( TaskHookFunction_t ) 15 );
+#endif
+    /***************************************Queues-Semaphores-mutexes Creation****************************************/
+    xEventGroup = xEventGroupCreate();
+    xReadToCtrlSeat1 = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    xReadToCtrlSeat2 = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    xSetToCtrlSeat1 = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    xSetToCtrlSeat2 = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    xCtrlToHeatSeat1 = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    xCtrlToHeatSeat2 = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    xCtrlToError = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    xSetToStateSeat1 = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    xSetToStateSeat2 = xQueueCreate(QUEUE_SIZE,sizeof(uint8));
+    set_read_to_ctrl_seat_1 = xQueueCreateSet(QUEUE_SIZE*2);
+    set_read_to_ctrl_seat_2 = xQueueCreateSet(QUEUE_SIZE*2);
+    xQueueAddToSet(xReadToCtrlSeat1, set_read_to_ctrl_seat_1);
+    xQueueAddToSet(xSetToCtrlSeat1, set_read_to_ctrl_seat_1);
+    xQueueAddToSet(xReadToCtrlSeat2, set_read_to_ctrl_seat_2);
+    xQueueAddToSet(xSetToCtrlSeat2, set_read_to_ctrl_seat_2);
+    /**************************************Queues Registering for RTMs************************************************/
+#if(RTM_MEASUREMENTS == 1)
+
+    vQueueAddToRegistry(set_read_to_ctrl_seat_2, (char*)1);
+    vQueueAddToRegistry(set_read_to_ctrl_seat_1, (char*)2);
+    vQueueAddToRegistry(xCtrlToHeatSeat1, (char*)3);
+    vQueueAddToRegistry(xCtrlToHeatSeat2, (char*)4);
+    vQueueAddToRegistry(xCtrlToError, (char*)5);
+    vQueueAddToRegistry(xSetToStateSeat1, (char*)6);
+    vQueueAddToRegistry(xSetToStateSeat2, (char*)7);
+#endif
+    /* Now all the tasks have been started - start the scheduler.*/
+
+
+    vTaskStartScheduler();
+
+    /* Should never reach here!  If you do then there was not enough heap
+        available for the idle task to be created. */
+    for (;;);
+
+}
+
+
+/*
+ * Description: Takes the state set by the user and the current temperature to calculate the desired temperature and the desired state for the heater
+ *  and sends it to the heating task, it also responsible of handling errors when the current temperature gets out of the allowed range,
+ *   determines the type of error and send an error code to the Temperature reporting task to log the error,
+ *   also sets an event flag to wake the temperature warning task,It also updated the display data to be displayed by the display task.
+ *
+ * Type : Event-Based.
+ *
+ * Events To Wait for : Waits on a queue for both the state set by the user and the current temperature of the seat.
+ *
+ * Events To Set: Error event flag to wake up the error warning task
+ */
+void vControlTask(void *pvParameters)
+{
+    seat_t* seat = (seat_t*)pvParameters;
+    QueueHandle_t recQueue;
+    QueueHandle_t sendQueue = *(seat->ctrl_to_heat_queue);
+    uint8 temp;
+    heatLevel_t recState=OFF;
+    heatLevel_t sentState;
+    uint8 desiredTemp;
+    boolean xErrorFlag = FALSE;
+    boolean xPrevError = FALSE;
+    DisplayData_t* displayData;
+    if(seat->id == DRIVER_ID)
+    {
+        displayData = &xDriverDisplayData;
+    }
+    else if(seat->id == PASSENGER_ID)
+    {
+        displayData = &xPassengerDisplayData;
+    }
+    else
+    {
+
+    }
+
+    for (;;)
+    {
+        recQueue = xQueueSelectFromSet(*(seat->set_read_to_ctrl_queue_set), portMAX_DELAY);
+        if(recQueue == *(seat->read_to_ctrl_queue))
+        {
+            xQueueReceive(recQueue, &temp, 0);
+            displayData->currentTemp = temp;
+            if(temp > 40 || temp < 5)
+            {
+                uint8 errorCode;
+                xErrorFlag = TRUE;
+                displayData->errorFlag = TRUE;
+                if(seat->id == DRIVER_ID)
+                {
+                    if(temp<5)
+                    {
+                        errorCode = DEC_Temp_BELOW_5;
+                        xQueueSend(xCtrlToError,&errorCode,0);
+                    }
+                    else if(temp>40)
+                    {
+                        errorCode = DEC_Temp_ABOVE_40;
+                        xQueueSend(xCtrlToError,&errorCode,0);
+                    }
+                    else
+                    {
+
+                    }
+                }
+                else if(seat->id == PASSENGER_ID)
+                {
+                    if(temp<5)
+                    {
+                        errorCode = PEC_Temp_BELOW_5;
+                        xQueueSend(xCtrlToError,&errorCode,0);
+                    }
+                    else if(temp>40)
+                    {
+                        errorCode = PEC_Temp_ABOVE_40;
+                        xQueueSend(xCtrlToError,&errorCode,0);
+                    }
+                    else
+                    {
+
+                    }
+                }
+            }
+            else
+            {
+                xErrorFlag = FALSE;
+                displayData->errorFlag = FALSE;
+            }
+        }
+        else if(recQueue == *(seat->set_to_ctrl_queue))
+        {
+            xQueueReceive(recQueue, &recState, 0);
+            switch (recState) {
+            case LOW:
+                desiredTemp = 25;
+                break;
+            case MEDIUM:
+                desiredTemp = 30;
+                break;
+            case HIGH:
+                desiredTemp = 35;
+                break;
+            default:
+                desiredTemp = 0;
+                break;
+            }
+            displayData->desiredTemp = desiredTemp;
+
+        }
+        if(xErrorFlag == TRUE)
+        {
+            sentState = OFF;
+            xPrevError = TRUE;
+            xEventGroupSetBits(xEventGroup, seat->error_reporting_mask);
+        }
+        else if(xErrorFlag == FALSE)
+        {
+            if(xPrevError == TRUE)
+            {
+                xPrevError = FALSE;
+                xEventGroupSetBits(xEventGroup, seat->error_handling_mask);
+            }
+            else
+            {
+
+            }
+            if(recState == OFF)
+            {
+                sentState = OFF;
+            }
+            else
+            {
+                sentState = getDesiredHeatLevel(temp, desiredTemp);
+            }
+        }
+        else
+        {
+
+        }
+        displayData->workingState = sentState;
+        xQueueSend(sendQueue,&sentState,0);
+
+    }
+}
+/*
+ * Description: Takes the state set by the user and the current temperature to calculate the desired temperature and the desired state for the heater
+        and sends it to the heating task, it also responsible of handling errors when the current temperature gets out of the allowed range,
+        determines the type of error and send an error code to the Temperature reporting task to log the error,
+        also sets an event flag to wake the temperature warning task,It also updated the display data to be displayed by the display task.
+
+ * Type : Event-Based.
+ *
+ * Events To Wait for : Waits on a queue for both the state set by the user and the current temperature of the seat.
+ *
+ * Events To Set: Error event flag to wake up the error warning task
+ */
+void vHeatingTask(void *pvParameters)
+{
+    seat_t* seat = (seat_t*)pvParameters;
+    QueueHandle_t recQueue=*(seat->ctrl_to_heat_queue);
+    heatLevel_t state ;
+    for (;;)
+    {
+        xQueueReceive(recQueue, &state, portMAX_DELAY);
+        Heater_setTemp(seat->led, state);
+
+    }
+}
+
+/*
+ * Description: Reads the current temperature from the temperature sensor every 50 ms and send it to the control.
+ * Type: Periodic.
+ * Periodicity: 50 ms
+ */
+void vTemperatureReadingTask(void *pvParameters)
+{
+    seat_t* seat = (seat_t*)pvParameters;
+    uint16 data;
+    QueueHandle_t read_to_ctrl = *(seat->read_to_ctrl_queue);
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    for(;;)
+    {
+        vTaskDelayUntil(&xLastWakeTime,pdMS_TO_TICKS(50));
+        data = tempSensor_readTemp(seat->tempSensor);
+        xQueueSend(read_to_ctrl,&data,0);
+    }
+}
+
+/*
+ * Description: Sets the state of the system desired by the user and Sends it to the control Task and the State Update Task.
+ * Type : Event-Based.
+ * Events To Wait for: Waken when a user pressed the button by waiting for an event flag that is set by an interrupt which is fired when the button is pressed.
+ */
+void vTemperatureSettingTask(void* pvParameters)
+{
+    seat_t* seat = (seat_t*)pvParameters;
+    EventBits_t eventbits;
+    uint8 state = OFF;
+    QueueHandle_t sendToCtrlQueue = *(seat->set_to_ctrl_queue);
+    QueueHandle_t sendToSetQueue = *(seat->set_to_state_queue);
+    for(;;)
+    {
+        eventbits = xEventGroupWaitBits(xEventGroup, seat->setting_task_mask, pdTRUE, pdFALSE, portMAX_DELAY);
+
+        if(eventbits & seat->setting_task_mask)
+        {
+            state = (state + 1) % 4;
+            xQueueSend(sendToCtrlQueue,&state,0);
+            xQueueSend(sendToSetQueue,&state,0);
+        }
+
+
+
+    }
+}
+
+/*
+ * Description: It logs the error with a time stamp taken and saves it in a circular array for error logs.
+ * Type : Event-Based.
+ * Events To Wait for : Waits on a queue for the Error code sent by the Control Task.
+ */
+void vTempErrorReportingTask(void* pvParameters)
+{
+    uint8 counter=0;
+    TickType_t timeStamp;
+    uint8 errorCode ;
+    for(;;)
+    {
+
+        xQueueReceive(xCtrlToError, &errorCode, portMAX_DELAY);
+        timeStamp = GPTM_WTimer0Read();
+        switch (errorCode) {
+        case DEC_Temp_BELOW_5:
+            strcpy((char*)xErrorLogArray[counter].ucErrorDetails, "Driver Seat Temperature Fell Below 5 Degrees");
+            break;
+        case DEC_Temp_ABOVE_40:
+            strcpy((char*)xErrorLogArray[counter].ucErrorDetails, "Driver Seat Temperature Risen Above 40 Degrees");
+            break;
+        case PEC_Temp_BELOW_5:
+            strcpy((char*)xErrorLogArray[counter].ucErrorDetails, "Passenger Seat Temperature Fell Below 5 Degrees");
+            break;
+        case PEC_Temp_ABOVE_40:
+            strcpy((char*)xErrorLogArray[counter].ucErrorDetails, "Passenger Seat Temperature Risen above 40 Degrees");
+            break;
+        default:
+            break;
+        }
+        xErrorLogArray[counter].xErrorTimeStamp = timeStamp;
+        counter = (counter + 1) % 10;
+
+    }
+}
+
+/*
+ * Description: Warns the user of an error by turning on a red led .
+ * Type : Event-Based.
+ * Events To Wait for : Waits on to flags from the control task on flag represents an error in the system to which it responds by turning on the led ,
+     and another flag represents an error being handled or no longer exists to which it responds by turning off the led.
+ */
+void vTempErrorWarningTask(void* pvParameters)
+{
+    seat_t* seat = (seat_t*)pvParameters;
+    uint16 RaisErrorMask = seat->error_reporting_mask;
+    uint16 ErrorHandledMask = seat->error_handling_mask;
+    rgb_ledType* xErrorLed = seat->led;
+    EventBits_t xEventBits;
+    for(;;)
+    {
+        xEventBits = xEventGroupWaitBits(xEventGroup, RaisErrorMask|ErrorHandledMask, pdTRUE, pdFALSE, portMAX_DELAY);
+        if(xEventBits & RaisErrorMask)
+        {
+            rgb_redLedON(xErrorLed);
+        }
+        else if(xEventBits & ErrorHandledMask)
+        {
+            rgb_redLedOFF(xErrorLed);
+        }
+        else
+        {
+
+        }
+    }
+}
+
+/*
+ * Description: Updates the current state of the system taking a timestamp with every state change set by the user.
+ * Type : Event-Based.
+ * Events To Wait for : Waits on a queue to receive the new state from the Temperature Setting task.
+ */
+void vStateUpdateTask(void* pvParameters)
+{
+    seat_t* seat = (seat_t*)pvParameters;
+    QueueHandle_t recQueue = *(seat->set_to_state_queue);
+    TickType_t timestamp;
+    heatLevel_t state ;
+    StateLog_t* stateLog = seat->state;
+
+    for(;;)
+    {
+        xQueueReceive(recQueue, &state, portMAX_DELAY);
+        timestamp = GPTM_WTimer0Read();
+        stateLog->heatLevel = state;
+        stateLog->timestamp = timestamp;
+    }
+}
+
+/*
+ * Description: Displays the state of the system including the current temperature for each seat and the heating state of the it's heater and
+      the desigerd temperature , also displays error info if exists.
+ * Type: Periodic.
+ * Periodicity: 500 ms
+ */
+void vStateDisplayTask(void* pvParameters)
+{
+    uint8 counter ;
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    for(;;)
+    {
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
+        DisplayData_t displaydata[2] = {xDriverDisplayData,xPassengerDisplayData};
+        for(counter=0;counter<2;counter++)
+        {
+            if(0 == counter)
+                UART0_SendString("Driver:\r\n");
+            else if(1 == counter)
+                UART0_SendString("Passenger:\r\n");
+
+            UART0_SendString("seat current Temperature = ");
+            UART0_SendInteger(displaydata[counter].currentTemp);
+            UART0_SendString("\r\nDesired Temperature = ");
+            UART0_SendInteger(displaydata[counter].desiredTemp);
+            if(displaydata[counter].errorFlag == TRUE)
+            {
+                UART0_SendString("\r\nHeater is Turned OFF due to error; Temperature is out of correct range\r\n");
+            }
+            else
+            {
+                if(displaydata[counter].workingState == OFF)
+                {
+                    UART0_SendString("\r\nHeater is Turned OFF\r\n");
+                }
+                else
+                {
+                    UART0_SendString("\r\n Heater is Working with ");
+                    switch (displaydata[counter].workingState) {
+                    case LOW:
+                        UART0_SendString("LOW");
+                        break;
+                    case MEDIUM:
+                        UART0_SendString("MEDIUM");
+                        break;
+                    case HIGH:
+                        UART0_SendString("HIGH");
+                        break;
+                    default:
+                        break;
+                    }
+                    UART0_SendString(" Intensity\r\n");
+                }
+            }
+            UART0_SendString("/*-----------------------------------------------------------------------------------*/\r\n");
+        }
+    }
+}
+
+#if(RTM_MEASUREMENTS == 1)
+
+/*
+ * Description:  Calculates The Blocking Time of each queue
+ * Type: Periodic.
+ * Periodicity: 2000 ms
+ */
+void vRunTimeMeasurementsTask(void *pvParameters)
+{
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    for (;;)
+    {
+        uint8 ucCounter;
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(2000));
+        taskENTER_CRITICAL();
+
+        for(ucCounter = 1 ; ucCounter<8 ; ucCounter++)
+        {
+
+            UART0_SendString("block time for queue ");
+            UART0_SendInteger(ucCounter);
+            UART0_SendString(" is : ");
+            UART0_SendInteger(ullTotalTaskBlockTime[ucCounter] / 10);
+            UART0_SendString(" ms \r\n");
+        }
+
+        UART0_SendString("|****************************************************|\r\n");
+        taskEXIT_CRITICAL();
+
+    }
+
+}
+
+#endif
+/***********************************************************************
+ *                       FUNCTIONS DEFINITION                          *
+ ***********************************************************************/
+
+void Delay_MS(unsigned long long n)
+{
+    volatile unsigned long long count = 0;
+    while(count++ < (NUMBER_OF_ITERATIONS_PER_ONE_MILI_SECOND * n) );
+}
+
+static void prvSetupHardware( void )
+{
+    /* Place here any needed HW initialization such as GPIO, UART, etc.  */
+    Mcu_Init();
+    rgb_init(&led);
+    rgb_init(&led2);
+    ADC0_init(driverSeat.tempSensor->adc_channel);
+    ADC0_init(passengerSeat.tempSensor->adc_channel);
+    GPIO_BuiltinButtonsLedsInit();
+    GPIO_SW1EdgeTriggeredInterruptInit();
+    GPIO_SW2EdgeTriggeredInterruptInit();
+    UART0_Init();
+    GPTM_WTimer0Init();
+}
+
+void Mcu_Init(void)
+{
+    /* Enable clock for All PORTs and wait for clock to start */
+    SYSCTL_RCGCGPIO_REG |= 0x3F;
+    while(!(SYSCTL_PRGPIO_REG & 0x3F));
+}
+
+
+void Heater_setTemp(rgb_ledType* led , heatLevel_t level)
+{
+    /* Turn on Leds according to the required Heat level*/
+    switch (level) {
+    case OFF:
+        rgb_greenLedOFF(led);
+        rgb_blueLedOFF(led);
+        break;
+    case LOW:
+        rgb_blueLedON(led);
+        rgb_greenLedOFF(led);
+        break;
+    case MEDIUM:
+        rgb_greenLedON(led);
+        rgb_blueLedOFF(led);
+        break;
+    case HIGH:
+        rgb_greenLedON(led);
+        rgb_blueLedON(led);
+        break;
+    default:
+        break;
+    }
+}
+
+
+/*Calculates the heat level of the heater based on the current temp and the desired temp*/
+heatLevel_t getDesiredHeatLevel(uint8 currentTemp,uint8 desiredTemp)
+{
+    sint8 tempDif = desiredTemp - currentTemp ;
+    if(tempDif >= 10)
+    {
+        return HIGH;
+    }
+    else if((tempDif<10) && (tempDif>=5))
+    {
+        return MEDIUM;
+    }
+    else if((tempDif>=2)&&(tempDif<5))
+    {
+        return LOW;
+
+    }
+    else if(tempDif<2)
+    {
+        return OFF;
+    }
+    else
+    {
+        return OFF;
+    }
+}
+
+
+/*-----------------------------ISRS---------------------------------------*/
+
+void GPIO_portfHandler(void)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if(GPIO_PORTF_RIS_REG & (1<<0))           /* PF0 handler code */
+    {
+        xEventGroupSetBitsFromISR(xEventGroup, mainSW2_INTERRUPT_BIT,&xHigherPriorityTaskWoken);
+        GPIO_PORTF_ICR_REG   |= (1<<0);       /* Clear Trigger flag for PF0 (Interrupt Flag) */
+    }
+    else if(GPIO_PORTF_RIS_REG & (1<<4))      /* PF4 handler code */
+    {
+        xEventGroupSetBitsFromISR(xEventGroup, mainSW1_INTERRUPT_BIT,&xHigherPriorityTaskWoken);
+        GPIO_PORTF_ICR_REG   |= (1<<4);       /* Clear Trigger flag for PF4 (Interrupt Flag) */
+    }
+
+    portYIELD_FROM_ISR( xHigherPriorityTaskWoken );
+}

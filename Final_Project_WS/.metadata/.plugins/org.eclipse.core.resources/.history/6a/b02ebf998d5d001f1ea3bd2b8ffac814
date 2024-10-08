@@ -1,0 +1,22 @@
+/*
+ * temp_sensor.c
+ *
+ *  Created on: Aug 18, 2024
+ *      Author: Mark
+ */
+
+#include "temp_sensor.h"
+
+uint8 tempSensor_readTemp(tempSensor_sensortype* sensor)
+{
+    uint16 adcValue;
+    uint8 temp;
+    ADC0_changeChannel(sensor->adc_channel);
+    ADC0_startConversion();
+    while(ADC0_busy());
+    adcValue = ADC0_readValue();
+    temp = (uint8)(((uint32)adcValue*ADC_REF_VOLTAGE)/ADC_MAX_VALUE);
+    return temp;
+}
+
+
